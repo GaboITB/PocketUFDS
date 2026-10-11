@@ -1,0 +1,166 @@
+diff --git a/radio/src/boards/generic_stm32/led_driver.cpp b/radio/src/boards/generic_stm32/led_driver.cpp
+index d2596ef..ed66a25 100644
+--- a/radio/src/boards/generic_stm32/led_driver.cpp
++++ b/radio/src/boards/generic_stm32/led_driver.cpp
+@@ -142,6 +142,21 @@ __weak void ledBlue()
+ #endif
+ }
+ 
++// GaboLabs : couleur composée (bit 0 rouge, bit 1 vert, bit 2 bleu), pour l'animation de démarrage
++void ledRGB(uint8_t rgb)
++{
++  ledOff();
++#if defined(LED_RED_GPIO)
++  if (rgb & 1) GPIO_LED_GPIO_ON(LED_RED_GPIO);
++#endif
++#if defined(LED_GREEN_GPIO)
++  if (rgb & 2) GPIO_LED_GPIO_ON(LED_GREEN_GPIO);
++#endif
++#if defined(LED_BLUE_GPIO)
++  if (rgb & 4) GPIO_LED_GPIO_ON(LED_BLUE_GPIO);
++#endif
++}
++
+ #if defined(FUNCTION_SWITCHES_RGB_LEDS)
+ __weak uint32_t fsGetLedRGB(uint8_t index)
+ {
+diff --git a/radio/src/gui/128x64/splash.cpp b/radio/src/gui/128x64/splash.cpp
+index 237ffaa..1f462cf 100644
+--- a/radio/src/gui/128x64/splash.cpp
++++ b/radio/src/gui/128x64/splash.cpp
+@@ -21,16 +21,70 @@
+ 
+ #include "edgetx.h"
+ 
+-const unsigned char splashdata[]  = {
+-  'S','P','S',0,
+-  #include "bitmaps/128x64/splash.lbm"
+-  'S','P','E',0 };
++// Animation de démarrage GaboLabs (personnalisation locale, hors EdgeTX officiel).
++// L'ancien logo fixe est retiré pour libérer de la flash (Pocket : 512 Ko, quasi pleine).
++#include "gabolabs_splash.h"
+ 
+-const unsigned char * const splash_lbm = splashdata+4;
++static uint8_t gabolabs_ecran[LCD_W * LCD_H / 8];  // image courante, 1 bit par pixel
+ 
+-void drawSplash()
++uint16_t gabolabsFrameCount() { return GABOLABS_ANIM_FRAMES; }
++
++uint8_t gabolabsFrameDuration(uint16_t idx)
++{
++  return gabolabs_anim_durations[idx];
++}
++
++// Applique la différence de l'image idx (plages inchangé/changé), puis affiche l'image
++void drawGabolabsFrame(uint16_t idx)
+ {
++  if (idx == 0) memset(gabolabs_ecran, 0, sizeof(gabolabs_ecran));
++  const uint8_t * p = gabolabs_anim_data + gabolabs_anim_offsets[idx];
++  uint16_t pos = 0;
++  bool change = false;
++  while (pos < LCD_W * LCD_H) {
++    uint16_t n = *p++;
++    if (n & 0x80) n = ((n & 0x7F) << 8) | *p++;
++    if (change) {
++      for (uint16_t k = pos; k < pos + n; k++) gabolabs_ecran[k >> 3] ^= (1 << (k & 7));
++    }
++    pos += n;
++    change = !change;
++  }
+   lcdClear();
+-  lcdDraw1bitBitmap(0, 0, splash_lbm, 0, 0);
++  for (uint16_t k = 0; k < LCD_W * LCD_H; k++) {
++    if (gabolabs_ecran[k >> 3] & (1 << (k & 7))) lcdDrawPoint(k % LCD_W, k / LCD_W);
++  }
+   lcdRefresh();
+ }
++
++void drawSplash()
++{
++  drawGabolabsFrame(0);
++}
++
++// Jeu de lumière synchronisé sur l'animation (LED du bouton d'alimentation)
++#include "gabolabs_leds.h"
++void ledRGB(uint8_t rgb);
++
++void gabolabsLedUpdate(uint16_t ecoule)
++{
++#if defined(STATUS_LEDS)
++  uint8_t i = 0;
++  while (i + 1 < DIM(gabolabs_leds) && ecoule >= gabolabs_leds[i + 1].debut) i++;
++  const GabolabsLedPlage & p = gabolabs_leds[i];
++  bool alterne = p.periode && ((ecoule - p.debut) / p.periode) % 2;
++  ledRGB(alterne ? p.b : p.a);
++#endif
++}
++
++// Remet la LED dans son état normal après l'animation (même logique que boardInit)
++void gabolabsLedRestore()
++{
++#if defined(STATUS_LEDS)
++#if !defined(POWER_LED_BLUE)
++  ledBlue();
++#else
++  ledGreen();
++#endif
++#endif
++}
+diff --git a/radio/src/gui/common/stdlcd/menus_common.h b/radio/src/gui/common/stdlcd/menus_common.h
+index dff3e5f..89ca1a8 100644
+--- a/radio/src/gui/common/stdlcd/menus_common.h
++++ b/radio/src/gui/common/stdlcd/menus_common.h
+@@ -199,6 +199,11 @@ void deleteExpo(uint8_t idx);
+ uint8_t switchToMix(uint8_t source);
+ 
+ void drawSplash();
++uint16_t gabolabsFrameCount();
++uint8_t gabolabsFrameDuration(uint16_t idx);
++void drawGabolabsFrame(uint16_t idx);
++void gabolabsLedUpdate(uint16_t ecoule);
++void gabolabsLedRestore();
+ void doMainScreenGraphics();
+ void drawAlertBox(const char * title, const char * text, const char * action);
+ 
+diff --git a/radio/src/gui/common/stdlcd/splash.cpp b/radio/src/gui/common/stdlcd/splash.cpp
+index d52a116..1f39360 100644
+--- a/radio/src/gui/common/stdlcd/splash.cpp
++++ b/radio/src/gui/common/stdlcd/splash.cpp
+@@ -45,6 +45,37 @@ void waitSplash()
+ 
+   if (SPLASH_NEEDED() && splashStarted) {
+     resetBacklightTimeout();
++#if LCD_W == 128 && LCD_H == 64
++    // Animation GaboLabs : chaque image reste affichée sa durée, une touche ou un manche l'interrompt
++    // La LED du bouton d'alimentation suit l'horloge de l'animation, puis reprend sa couleur normale
++    getADC();
++    inactivityCheckInputs();
++    tmr10ms_t debut = get_tmr10ms();
++    tmr10ms_t fin = debut;
++    for (uint16_t f = 0; f < gabolabsFrameCount(); f++) {
++      drawGabolabsFrame(f);
++      fin += gabolabsFrameDuration(f);  // échéances cumulées : pas de dérive
++      while (fin > get_tmr10ms()) {
++        sleep_ms(1);
++        gabolabsLedUpdate(get_tmr10ms() - debut);
++        getADC();
++        // Seule une touche interrompt l'animation (un manche ou un inter mal placé ne la coupe
++        // plus : les alertes de démarrage s'affichent après). La bande-son s'arrête avec elle.
++        if (getEvent()) {
++          audioQueue.stopAll();
++          gabolabsLedRestore();
++          return;
++        }
++        if (pwrCheck() == e_power_off) {
++          gabolabsLedRestore();
++          return;
++        }
++        checkBacklight();
++      }
++    }
++    gabolabsLedRestore();
++    return;
++#endif
+     drawSplash();
+ 
+     getADC(); // init ADC array
